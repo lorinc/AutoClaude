@@ -1,0 +1,3 @@
+# Cloud Run staging service template — Phase 6
+# Variables: $PROJECT_NAME, $IMAGE, $STAGING_URL, $GCP_PROJECT_ID
+# TODO: implement in Phase 6

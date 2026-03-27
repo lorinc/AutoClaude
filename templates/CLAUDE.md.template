@@ -1,0 +1,69 @@
+# {{PROJECT_NAME}}
+
+{{PROJECT_DESCRIPTION}}
+
+## Stack
+
+{{STACK}}
+
+## Non-default decisions
+
+{{NON_DEFAULT_DECISIONS}}
+
+---
+
+## File map
+
+```
+project-root/
+├── CLAUDE.md                  # ROOT — always loaded. File map and non-default decisions only.
+├── status.md                  # Always loaded. Last outcome + next session goal.
+├── devlog.md                  # Always loaded via `tail -30`. Append-only event log.
+├── plan.md                    # Lazy. Epics, decisions, ADRs.
+├── .env                       # Gitignored. GCP_PROJECT_ID + project-specific local dev secrets.
+│
+├── tasks/
+│   ├── pending/               # Orchestrator polls here. Each task = one .md file.
+│   ├── active/                # Orchestrator moves task here when session starts.
+│   ├── done/                  # Orchestrator archives here after session closes.
+│   └── ideas/                 # Blocked tasks. Held until trunk is clean.
+│
+├── src/
+│   ├── CLAUDE.md              # Lazy. Load when task touches >1 module.
+│   └── {{MODULE}}/
+│       ├── CLAUDE.md          # Lazy. Load for any task touching this module.
+│       └── ...
+│
+└── tests/
+    ├── CLAUDE.md              # Lazy. Test conventions and fixture strategy.
+    ├── unit/
+    │   └── CLAUDE.md          # Lazy. Unit test scope and patterns.
+    ├── integration/
+    │   └── CLAUDE.md          # Lazy. Integration test scope and patterns.
+    ├── smoke/
+    │   ├── CLAUDE.md          # Guard — do not load unless task references smoke tests explicitly.
+    │   ├── staging_smoke.py   # Post-deploy verification. Max 3 paths, 60s timeout.
+    │   └── local_smoke.py     # Pre-push validation against localhost.
+    └── scratchpad/            # Agent sandbox. Gitignored. Free to write here during debugging.
+```
+
+---
+
+## Context loading protocol
+
+**Follow this sequence in order. Do not skip steps. Do not reorder.**
+
+```
+1. Read this file (CLAUDE.md) — file map and non-default decisions only.
+2. Read status.md — last outcome and next session goal.
+3. Run `tail -30 devlog.md` — recent event log for orientation.
+4. Read the active task spec from tasks/active/.
+5. Load lazy files only as needed for the current task:
+   - src/CLAUDE.md if the task touches more than one module
+   - src/<module>/CLAUDE.md for each module touched
+   - tests/CLAUDE.md and relevant test subdirectory CLAUDE.md
+   - plan.md only if the task spec references an ADR or epic
+6. Do not load any other files until a failing test requires it.
+```
+
+This sequence is the contract. You are not permitted to reorder or skip steps.

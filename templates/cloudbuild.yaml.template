@@ -1,0 +1,4 @@
+# GCP Cloud Build CI template — Phase 6
+# Parameterised for FastAPI projects.
+# Variables: $PROJECT_NAME, $STAGING_URL, $GCP_PROJECT_ID
+# TODO: implement in Phase 6
