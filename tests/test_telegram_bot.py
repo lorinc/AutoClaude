@@ -1,18 +1,19 @@
-import time
-from unittest.mock import MagicMock, call, patch
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 
 from orchestrator.telegram_bot import (
     ApprovalResult,
+    TelegramCommandDispatcher,
     get_updates,
     make_notify_stuck,
     notify_stuck,
     notify_uat_ready,
     send_message,
-    wait_for_plan_approval,
 )
+from orchestrator.state_store import StateStore, TaskState
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +43,34 @@ def _update(update_id: int, chat_id: str | int, text: str) -> dict:
     }
 
 
+@pytest.fixture
+def store():
+    s = StateStore(":memory:")
+    yield s
+    s.close()
+
+
+@pytest.fixture
+def registry_path(tmp_path):
+    import json
+    reg = tmp_path / "registry.json"
+    reg.write_text(json.dumps([{
+        "name": "proj-a",
+        "repo_path": str(tmp_path / "proj-a"),
+        "github_url": "https://github.com/user/proj-a",
+    }]))
+    return reg
+
+
+def make_dispatcher(store, registry_path):
+    return TelegramCommandDispatcher(
+        token="tok",
+        chat_id="111111",
+        state_store=store,
+        registry_path=registry_path,
+    )
+
+
 # ---------------------------------------------------------------------------
 # send_message
 # ---------------------------------------------------------------------------
@@ -53,7 +82,6 @@ def test_send_message_posts_correct_payload():
 
     mock_post.assert_called_once()
     _, kwargs = mock_post.call_args
-    assert "bot123" not in mock_post.call_args[0][0]  # token in URL
     assert "bottok123" in mock_post.call_args[0][0]
     assert kwargs["json"]["chat_id"] == "chat456"
     assert kwargs["json"]["text"] == "hello world"
@@ -111,94 +139,13 @@ def test_get_updates_raises_on_non_2xx():
 
 
 # ---------------------------------------------------------------------------
-# wait_for_plan_approval
-# ---------------------------------------------------------------------------
-
-def test_approval_approve():
-    updates = [_update(1, "111111", "/approve")]
-    with patch("orchestrator.telegram_bot.send_message") as mock_send, \
-         patch("orchestrator.telegram_bot.get_updates", return_value=updates):
-        result = wait_for_plan_approval("tok", "111111", "plan text", timeout_seconds=60)
-
-    assert result == ApprovalResult(approved=True, reason=None)
-    assert mock_send.call_count == 2  # plan text + instructions
-
-
-def test_approval_reject_with_reason():
-    updates = [_update(1, "111111", "/reject the API design is wrong")]
-    with patch("orchestrator.telegram_bot.send_message"), \
-         patch("orchestrator.telegram_bot.get_updates", return_value=updates):
-        result = wait_for_plan_approval("tok", "111111", "plan", timeout_seconds=60)
-
-    assert result == ApprovalResult(approved=False, reason="the API design is wrong")
-
-
-def test_approval_reject_no_reason():
-    updates = [_update(1, "111111", "/reject")]
-    with patch("orchestrator.telegram_bot.send_message"), \
-         patch("orchestrator.telegram_bot.get_updates", return_value=updates):
-        result = wait_for_plan_approval("tok", "111111", "plan", timeout_seconds=60)
-
-    assert result == ApprovalResult(approved=False, reason=None)
-
-
-def test_approval_ignores_wrong_chat():
-    # First update from wrong chat, second from correct chat
-    call_count = 0
-
-    def fake_updates(token, offset=0, timeout=30):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return [_update(1, "999999", "/approve")]
-        return [_update(2, "111111", "/approve")]
-
-    with patch("orchestrator.telegram_bot.send_message"), \
-         patch("orchestrator.telegram_bot.get_updates", side_effect=fake_updates):
-        result = wait_for_plan_approval("tok", "111111", "plan", timeout_seconds=60)
-
-    assert result.approved is True
-    assert call_count == 2
-
-
-def test_approval_advances_offset():
-    """Offset increments so already-seen updates aren't re-processed."""
-    offsets_used = []
-
-    def fake_updates(token, offset=0, timeout=30):
-        offsets_used.append(offset)
-        if offset == 0:
-            return [_update(10, "111111", "random message")]
-        return [_update(11, "111111", "/approve")]
-
-    with patch("orchestrator.telegram_bot.send_message"), \
-         patch("orchestrator.telegram_bot.get_updates", side_effect=fake_updates):
-        result = wait_for_plan_approval("tok", "111111", "plan", timeout_seconds=60)
-
-    assert result.approved is True
-    assert offsets_used[0] == 0
-    assert offsets_used[1] == 11  # update_id 10 + 1
-
-
-def test_approval_timeout():
-    with patch("orchestrator.telegram_bot.send_message"), \
-         patch("orchestrator.telegram_bot.get_updates", return_value=[]), \
-         patch("orchestrator.telegram_bot.time.monotonic", side_effect=[0.0, 999.0, 999.0]):
-        result = wait_for_plan_approval("tok", "111111", "plan", timeout_seconds=1)
-
-    assert result == ApprovalResult(approved=False, reason="timeout")
-
-
-# ---------------------------------------------------------------------------
 # notify_stuck
 # ---------------------------------------------------------------------------
 
 def test_notify_stuck_sends_message():
     with patch("orchestrator.telegram_bot.send_message") as mock_send:
         notify_stuck("tok", "111111", "my-task", 2, "feature/my-task")
-
     mock_send.assert_called_once()
-    _, kwargs = mock_send.call_args
     text = mock_send.call_args[0][2]
     assert "my-task" in text
     assert "2" in text
@@ -212,7 +159,6 @@ def test_notify_stuck_sends_message():
 def test_notify_uat_ready_sends_message():
     with patch("orchestrator.telegram_bot.send_message") as mock_send:
         notify_uat_ready("tok", "111111", "proj-a", "https://staging.run.app", "Added rate limiting.")
-
     text = mock_send.call_args[0][2]
     assert "proj-a" in text
     assert "https://staging.run.app" in text
@@ -232,5 +178,126 @@ def test_make_notify_stuck_binds_token_and_chat():
     with patch("orchestrator.telegram_bot.notify_stuck") as mock_notify:
         fn = make_notify_stuck("tok", "111111")
         fn("my-task", 1, "feature/my-task")
-
     mock_notify.assert_called_once_with("tok", "111111", "my-task", 1, "feature/my-task")
+
+
+# ---------------------------------------------------------------------------
+# TelegramCommandDispatcher — command dispatch
+# ---------------------------------------------------------------------------
+
+def test_dispatcher_ignores_wrong_chat(store, registry_path):
+    d = make_dispatcher(store, registry_path)
+    with patch.object(d, "_reply") as mock_reply:
+        d._handle_update(_update(1, "999999", "/status"))
+    mock_reply.assert_not_called()
+
+
+def test_dispatcher_cmd_status_empty(store, registry_path):
+    d = make_dispatcher(store, registry_path)
+    replies = []
+    with patch.object(d, "_reply", side_effect=replies.append):
+        d._handle_update(_update(1, "111111", "/status"))
+    assert len(replies) == 1
+    assert "Total tasks: 0" in replies[0]
+
+
+def test_dispatcher_cmd_status_with_tasks(store, registry_path):
+    store.add_task("proj-a", "fix-bug", "/path.md")
+    store.add_task("proj-a", "add-feat", "/path2.md")
+    d = make_dispatcher(store, registry_path)
+    replies = []
+    with patch.object(d, "_reply", side_effect=replies.append):
+        d._handle_update(_update(1, "111111", "/status"))
+    assert "PENDING: 2" in replies[0]
+
+
+def test_dispatcher_cmd_list_all(store, registry_path):
+    store.add_task("proj-a", "fix-bug", "/path.md")
+    d = make_dispatcher(store, registry_path)
+    replies = []
+    with patch.object(d, "_reply", side_effect=replies.append):
+        d._handle_update(_update(1, "111111", "/list"))
+    assert "fix-bug" in replies[0]
+
+
+def test_dispatcher_cmd_cancel_pending(store, registry_path):
+    store.add_task("proj-a", "fix-bug", "/path.md")
+    d = make_dispatcher(store, registry_path)
+    with patch.object(d, "_reply"):
+        d._handle_update(_update(1, "111111", "/cancel fix-bug"))
+    task = store.get_task("proj-a", "fix-bug")
+    assert task.state == TaskState.CANCELLED
+
+
+def test_dispatcher_cmd_cancel_missing(store, registry_path):
+    d = make_dispatcher(store, registry_path)
+    replies = []
+    with patch.object(d, "_reply", side_effect=replies.append):
+        d._handle_update(_update(1, "111111", "/cancel nonexistent"))
+    assert "not found" in replies[0].lower() or "No task" in replies[0]
+
+
+def test_dispatcher_cmd_approve(store, registry_path):
+    d = make_dispatcher(store, registry_path)
+    # Register a pending approval
+    store.add_task("proj-a", "fix-bug", "/path.md")
+    d._pending_approval["fix-bug"] = None
+    with patch.object(d, "_reply"):
+        d._handle_update(_update(1, "111111", "/approve"))
+    result = d.poll_approval("fix-bug")
+    assert result is not None
+    assert result.approved is True
+
+
+def test_dispatcher_cmd_reject_with_reason(store, registry_path):
+    d = make_dispatcher(store, registry_path)
+    d._pending_approval["fix-bug"] = None
+    with patch.object(d, "_reply"):
+        d._handle_update(_update(1, "111111", "/reject the design is wrong"))
+    result = d.poll_approval("fix-bug")
+    assert result.approved is False
+    assert result.reason == "the design is wrong"
+
+
+def test_dispatcher_cmd_hint_appends_guide(store, registry_path):
+    store.add_task("proj-a", "fix-bug", "/path.md")
+    d = make_dispatcher(store, registry_path)
+    with patch.object(d, "_reply"):
+        d._handle_update(_update(1, "111111", "/hint fix-bug try checking the null pointer at line 42"))
+    task = store.get_task("proj-a", "fix-bug")
+    assert "null pointer at line 42" in (task.explore_guide or "")
+
+
+def test_dispatcher_cmd_unknown(store, registry_path):
+    d = make_dispatcher(store, registry_path)
+    replies = []
+    with patch.object(d, "_reply", side_effect=replies.append):
+        d._handle_update(_update(1, "111111", "/notacommand"))
+    assert "Unknown command" in replies[0]
+
+
+def test_dispatcher_approval_no_pending(store, registry_path):
+    d = make_dispatcher(store, registry_path)
+    replies = []
+    with patch.object(d, "_reply", side_effect=replies.append):
+        d._handle_update(_update(1, "111111", "/approve"))
+    assert "No pending approval" in replies[0]
+
+
+# ---------------------------------------------------------------------------
+# TelegramCommandDispatcher — request_approval / poll_approval
+# ---------------------------------------------------------------------------
+
+def test_request_approval_sets_pending(store, registry_path):
+    d = make_dispatcher(store, registry_path)
+    with patch("orchestrator.telegram_bot.send_message"):
+        d.request_approval("fix-bug", "Here is the plan.")
+    assert "fix-bug" in d._pending_approval
+    assert d._pending_approval["fix-bug"] is None  # waiting
+
+
+def test_clear_approval_removes_entry(store, registry_path):
+    d = make_dispatcher(store, registry_path)
+    d._pending_approval["fix-bug"] = ApprovalResult(approved=True, reason=None)
+    d.clear_approval("fix-bug")
+    assert "fix-bug" not in d._pending_approval

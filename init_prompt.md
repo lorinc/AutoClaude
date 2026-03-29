@@ -188,6 +188,7 @@ Same keys as `.env`. All values empty. One comment per key.
 __pycache__/
 *.pyc
 .venv/
+tasks/
 tests/scratchpad/
 tests/screenshots/
 ```

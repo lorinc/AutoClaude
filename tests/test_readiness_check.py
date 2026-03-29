@@ -6,12 +6,14 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from orchestrator.readiness_check import (
-    check_task_spec,
-    check_branch_clean,
-    check_no_duplicate_pr,
-    check_ci_green,
-    run,
+    MODEL_MAP,
     REQUIRED_SECTIONS,
+    check_branch_clean,
+    check_ci_green,
+    check_no_duplicate_pr,
+    check_task_spec,
+    parse_task_model,
+    run,
 )
 
 VALID_SPEC = """\
@@ -147,12 +149,89 @@ def test_no_duplicate_pr_gh_failure():
     assert "gh pr list failed" in result.reason
 
 
-# --- check_ci_green (stub) ---
+# --- check_ci_green ---
 
-def test_ci_green_always_passes():
-    result = check_ci_green("https://github.com/user/repo")
+def _mock_gh_run(stdout: str, returncode: int = 0):
+    mock = MagicMock()
+    mock.returncode = returncode
+    mock.stdout = stdout
+    mock.stderr = ""
+    return mock
+
+
+def test_ci_green_pass():
+    with patch("orchestrator.readiness_check.subprocess.run",
+               return_value=_mock_gh_run('[{"conclusion":"success"}]')):
+        result = check_ci_green("https://github.com/user/repo")
     assert result.passed
-    assert "stubbed" in result.reason
+
+
+def test_ci_green_no_runs():
+    with patch("orchestrator.readiness_check.subprocess.run",
+               return_value=_mock_gh_run("[]")):
+        result = check_ci_green("https://github.com/user/repo")
+    assert result.passed
+    assert "No CI runs" in result.reason
+
+
+def test_ci_green_failure():
+    with patch("orchestrator.readiness_check.subprocess.run",
+               return_value=_mock_gh_run('[{"conclusion":"failure"}]')):
+        result = check_ci_green("https://github.com/user/repo")
+    assert not result.passed
+    assert "failure" in result.reason
+
+
+def test_ci_green_gh_command_fails():
+    mock = _mock_gh_run("", returncode=1)
+    mock.stderr = "not authenticated"
+    with patch("orchestrator.readiness_check.subprocess.run", return_value=mock):
+        result = check_ci_green("https://github.com/user/repo")
+    assert not result.passed
+
+
+# --- parse_task_model ---
+
+def test_parse_task_model_explicit_haiku(tmp_path):
+    spec = tmp_path / "chore-bump-deps.md"
+    spec.write_text(VALID_SPEC + "\n## Model\nhaiku\n")
+    assert parse_task_model(spec) == MODEL_MAP["haiku"]
+
+
+def test_parse_task_model_explicit_opus(tmp_path):
+    spec = tmp_path / "add-feature.md"
+    spec.write_text(VALID_SPEC + "\n## Model\nopus\n")
+    assert parse_task_model(spec) == MODEL_MAP["opus"]
+
+
+def test_parse_task_model_unknown_value_defaults_sonnet(tmp_path):
+    spec = tmp_path / "add-feature.md"
+    spec.write_text(VALID_SPEC + "\n## Model\ngpt-4\n")
+    assert parse_task_model(spec) == MODEL_MAP["sonnet"]
+
+
+def test_parse_task_model_infer_haiku_from_chore_slug(tmp_path):
+    spec = tmp_path / "chore-update-deps.md"
+    spec.write_text(VALID_SPEC)
+    assert parse_task_model(spec) == MODEL_MAP["haiku"]
+
+
+def test_parse_task_model_infer_opus_from_architect_slug(tmp_path):
+    spec = tmp_path / "architect-new-pipeline.md"
+    spec.write_text(VALID_SPEC)
+    assert parse_task_model(spec) == MODEL_MAP["opus"]
+
+
+def test_parse_task_model_default_sonnet(tmp_path):
+    spec = tmp_path / "add-rate-limit.md"
+    spec.write_text(VALID_SPEC)
+    assert parse_task_model(spec) == MODEL_MAP["sonnet"]
+
+
+def test_parse_task_model_missing_file(tmp_path):
+    spec = tmp_path / "chore-missing.md"
+    # Missing file: slug has chore keyword → haiku even without content
+    assert parse_task_model(spec) == MODEL_MAP["haiku"]
 
 
 # --- run (integration) ---

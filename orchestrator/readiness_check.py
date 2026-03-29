@@ -19,6 +19,15 @@ REQUIRED_SECTIONS = frozenset({
 
 AGENT_BRANCH_PREFIXES = ("feature/", "fix/", "chore/")
 
+MODEL_MAP: dict[str, str] = {
+    "haiku": "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-4-6",
+}
+
+_DESIGN_KEYWORDS = ("architect", "design")
+_CHORE_KEYWORDS = ("chore", "cleanup", "refactor", "deps", "lint", "format", "bump")
+
 
 class CheckResult(BaseModel):
     passed: bool
@@ -105,9 +114,58 @@ def check_no_duplicate_pr(github_url: str, task_slug: str) -> CheckResult:
     return CheckResult(passed=True)
 
 
-def check_ci_green(github_url: str) -> CheckResult:  # noqa: ARG001
-    """GCP Cloud Build CI status. Stubbed until Phase 6."""
-    return CheckResult(passed=True, reason="CI check stubbed — always green until Phase 6")
+def check_ci_green(github_url: str) -> CheckResult:
+    """Check that the last completed GH Actions run on main succeeded."""
+    result = subprocess.run(
+        ["gh", "run", "list", "--repo", github_url,
+         "--branch", "main", "--status", "completed",
+         "--limit", "1", "--json", "conclusion"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return CheckResult(passed=False, reason=f"gh run list failed: {result.stderr.strip()}")
+    try:
+        runs = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return CheckResult(passed=False, reason="Failed to parse gh run list output")
+    if not runs:
+        return CheckResult(passed=True, reason="No CI runs on main yet")
+    conclusion = runs[0].get("conclusion", "")
+    if conclusion != "success":
+        return CheckResult(passed=False, reason=f"Last CI run on main: {conclusion}")
+    return CheckResult(passed=True)
+
+
+def _infer_model_from_slug(slug: str) -> str:
+    if any(kw in slug for kw in _DESIGN_KEYWORDS):
+        return MODEL_MAP["opus"]
+    if any(kw in slug for kw in _CHORE_KEYWORDS):
+        return MODEL_MAP["haiku"]
+    return MODEL_MAP["sonnet"]
+
+
+def parse_task_model(spec_path: Path) -> str:
+    """Return the Claude model ID for this task.
+
+    Reads optional '## Model' section (haiku / sonnet / opus).
+    Falls back to slug-based inference when the section is absent.
+    """
+    slug = spec_path.stem.lower()
+    try:
+        content = spec_path.read_text()
+    except FileNotFoundError:
+        return _infer_model_from_slug(slug)
+
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "## Model":
+            for value in lines[i + 1:]:
+                value = value.strip().lower()
+                if value:
+                    return MODEL_MAP.get(value, MODEL_MAP["sonnet"])
+            break
+
+    return _infer_model_from_slug(slug)
 
 
 def run(spec_path: Path, repo_path: Path, github_url: str, task_slug: str) -> ReadinessResult:
